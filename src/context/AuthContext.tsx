@@ -11,8 +11,12 @@ import {
 import { authApi } from '../services/api/auth'
 import { usersApi } from '../services/api/users'
 import {
+  refreshSession,
   sessionStore,
+  setSessionRefreshedHandler,
   setUnauthorizedHandler,
+  startSessionKeepAlive,
+  stopSessionKeepAlive,
   toApiError,
 } from '../services/api/client'
 import type { ApiErrorShape, SessionUser, UserProfile } from '../services/api/types'
@@ -31,7 +35,7 @@ interface AuthContextValue {
    * Completes a session from an externally-obtained token (the OAuth redirect).
    * Token is handed in already validated by the caller's URL parsing.
    */
-  adoptSession: (token: string, user: SessionUser) => void
+  adoptSession: (token: string, user: SessionUser, refreshToken?: string) => void
   register: (fullName: string, email: string, password: string) => Promise<void>
   logout: () => void
   refreshProfile: () => Promise<void>
@@ -59,6 +63,14 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const profileFetchedFor = useRef<string | null>(null)
 
   const logout = useCallback(() => {
+    // Revoke server-side first so a stolen refresh token dies with the session.
+    const refreshToken = sessionStore.getRefreshToken()
+    if (refreshToken) {
+      // Fire-and-forget: the local session is cleared regardless of the result.
+      void authApi.logout(refreshToken).catch(() => undefined)
+    }
+
+    stopSessionKeepAlive()
     sessionStore.clear()
     setUser(null)
     setToken(null)
@@ -76,8 +88,53 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       setSessionExpired(true)
       logout()
     })
-    return () => setUnauthorizedHandler(null)
+
+    // A silent renewal in the interceptor must be reflected in React state,
+    // otherwise the context still holds the old (now dead) token.
+    setSessionRefreshedHandler(() => {
+      const next = sessionStore.getToken()
+      const nextUser = sessionStore.getUser()
+      if (next) setToken(next)
+      if (nextUser) setUser(nextUser)
+      setSessionExpired(false)
+    })
+
+    return () => {
+      setUnauthorizedHandler(null)
+      setSessionRefreshedHandler(null)
+    }
   }, [logout])
+
+  /**
+   * Renewal also runs on a timer, so a tab left open past the access-token
+   * lifetime keeps working instead of waking up logged out.
+   */
+  useEffect(() => {
+    if (!token) return
+
+    startSessionKeepAlive()
+
+    // Coming back to a backgrounded tab is the classic case where the token
+    // expired while nothing was running.
+    const onVisible = () => {
+      if (document.visibilityState !== 'visible') return
+
+      const current = sessionStore.getToken()
+      if (current && !sessionStore.getUser()) return
+
+      void refreshSession().then((refreshed) => {
+        if (!refreshed) return
+        const next = sessionStore.getToken()
+        if (next) setToken(next)
+      })
+    }
+
+    document.addEventListener('visibilitychange', onVisible)
+
+    return () => {
+      document.removeEventListener('visibilitychange', onVisible)
+    }
+  }, [token])
 
   const loadProfile = useCallback(async () => {
     setProfileLoading(true)
@@ -136,19 +193,25 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }
   }, [logout])
 
-  const login = useCallback(async (email: string, password: string) => {
-    const response = await authApi.login({ email, password })
-    const sessionUser: SessionUser = {
-      id: response.id,
-      fullName: response.fullName,
-      email: response.email,
-    }
-    sessionStore.save(response.token, sessionUser)
-    setToken(response.token)
-    setUser(sessionUser)
-    setSessionExpired(false)
-    profileFetchedFor.current = response.token
-  }, [])
+  const login = useCallback(
+    async (email: string, password: string) => {
+      const response = await authApi.login({ email, password })
+      const sessionUser: SessionUser = {
+        id: response.id,
+        fullName: response.fullName,
+        email: response.email,
+      }
+      sessionStore.save(response.token, sessionUser, response.refreshToken)
+      setToken(response.token)
+      setUser(sessionUser)
+      setSessionExpired(false)
+      profileFetchedFor.current = response.token
+      startSessionKeepAlive()
+      // Fetch the full profile (provider, created date) for the settings page.
+      void loadProfile()
+    },
+    [loadProfile],
+  )
 
   /**
    * Registration returns no token (RegisterResponseDto has no Token property),
@@ -161,13 +224,18 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     [],
   )
 
-  const adoptSession = useCallback((nextToken: string, nextUser: SessionUser) => {
-    sessionStore.save(nextToken, nextUser)
-    setToken(nextToken)
-    setUser(nextUser)
-    setSessionExpired(false)
-    profileFetchedFor.current = nextToken
-  }, [])
+  const adoptSession = useCallback(
+    (nextToken: string, nextUser: SessionUser, nextRefreshToken?: string) => {
+      sessionStore.save(nextToken, nextUser, nextRefreshToken)
+      setToken(nextToken)
+      setUser(nextUser)
+      setSessionExpired(false)
+      profileFetchedFor.current = nextToken
+      startSessionKeepAlive()
+      void loadProfile()
+    },
+    [loadProfile],
+  )
 
   const applyProfileUpdate = useCallback((next: UserProfile) => {
     setProfile(next)

@@ -44,16 +44,16 @@ export const DOTNET_ENDPOINTS = {
   googleStart: {
     route: 'GET /api/login-google',
     service: 'dotnet',
-    status: 'partial',
+    status: 'live',
     source: 'StudyBuddy.API/Controllers/AuthController.cs',
-    note: 'Must be a top-level browser navigation. The follow-up GoogleResponse controller returns the login payload as JSON instead of redirecting back to the app, so the frontend cannot complete the session yet.',
+    note: 'Opened in a popup; redirects to Google. The popup lands on /api/auth/google-response.',
   },
   googleResponse: {
     route: 'GET /api/auth/google-response',
     service: 'dotnet',
-    status: 'partial',
+    status: 'live',
     source: 'StudyBuddy.API/Controllers/AuthController.cs',
-    note: 'Returns LoginResponse as raw JSON in the browser tab. Needs to redirect to the SPA with the token to complete the OAuth round trip.',
+    note: 'Returns LoginResponse as JSON. The SPA polls it with credentials: "include" to exchange the auth cookie for the token. Requires CORS with Access-Control-Allow-Credentials for the app origin.',
   },
   profile: {
     route: 'GET /api/users/me',
@@ -95,12 +95,19 @@ export const DOTNET_ENDPOINTS = {
     status: 'live',
     source: 'StudyBuddy.API/Controllers/KnowledgeController.cs',
   },
+  knowledgeNotes: {
+    route: 'GET /api/knowledge/notes?timeline=&subject=',
+    service: 'dotnet',
+    status: 'live',
+    source: 'StudyBuddy.API/Controllers/KnowledgeController.cs',
+    note: 'Returns { userId, timeline, subject, detailedNotes[], shortNotes[] } for the signed-in user. Defaults to timeline=30days.',
+  },
   ingest: {
     route: 'POST /api/v1/ingestion/upload',
     service: 'dotnet',
     status: 'live',
     source: 'StudyBuddy.API/Controllers/IngestionController.cs',
-    note: 'multipart/form-data: file, sourceType, title, description, learningDate. Processing (text extraction → summary → notes) happens synchronously and can take minutes: the AI HttpClient timeout is 10 minutes.',
+    note: 'multipart/form-data: File, SourceType, Title?, Description?, Subject?, LearningDate?. Processing (text extraction → summary → notes) happens synchronously and can take minutes: the client uses a 10-minute timeout. Requires a Gemini key saved via POST /api/users/me/gemini-key.',
   },
   adminUsers: {
     route: 'GET /api/admin/users',
@@ -192,10 +199,10 @@ export const MISSING_CAPABILITIES = {
       'No revision scheduling, spaced-repetition, flashcard or quiz endpoint exists. Knowledge documents do carry revisionPriority/complexityScore, which the UI surfaces as metadata only.',
   },
   userNotesListing: {
-    needed: 'GET /api/notes · GET /api/notes/{id}',
-    affects: 'AI Notes page — listing previously generated notes',
+    needed: 'GET /api/knowledge/notes — shipped',
+    affects: 'AI Notes page',
     detail:
-      'DetailedNotesService and ShortNotesService persist to Mongo, but only the ADMIN endpoints read them back. There is no user-facing notes controller. The Notes page therefore generates notes on demand from a knowledge document and does not claim to list saved history. Admin → user detail can view the persisted notes.',
+      'The user-facing notes listing is now live and the Notes page reads it directly. Notes are written during upload; there is still no endpoint for generating notes on demand from the browser.',
   },
   notePersistenceFromUi: {
     needed: 'POST /api/notes (persisting)',

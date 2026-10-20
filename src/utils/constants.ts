@@ -15,9 +15,9 @@ export const SOURCE_TYPE_LABELS: Record<string, string> = {
   SourceCode: 'Source code',
 }
 
-/** Mirrors StudyBuddy.Processor's registered processors. */
+/** Mirrors the extensions accepted by POST /api/v1/ingestion/upload. */
 export const ACCEPTED_FILE_EXTENSIONS =
-  '.pdf,.txt,.md,.png,.jpg,.jpeg,.cs,.js,.ts,.tsx,.jsx,.py,.java,.cpp,.c,.json,.html,.css'
+  '.txt,.pdf,.png,.jpg,.jpeg,.bmp,.gif,.tiff,.webp,.cs,.vb,.cpp,.c,.h,.hpp,.java,.py,.js,.ts,.tsx,.jsx,.go,.rs,.kt,.swift,.php,.rb,.scala,.html,.css,.scss,.sql,.json,.xml,.yml,.yaml,.toml,.ini,.config,.env,.md,.dockerfile'
 
 export const MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 

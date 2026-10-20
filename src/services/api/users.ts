@@ -1,5 +1,5 @@
 import { api } from './client'
-import type { UpdateProfileRequest, UserProfile } from './types'
+import type { GeminiKeyResponse, UpdateProfileRequest, UserProfile } from './types'
 
 export const usersApi = {
   /** GET /api/users/me */
@@ -15,6 +15,18 @@ export const usersApi = {
    */
   async updateMe(payload: UpdateProfileRequest): Promise<UserProfile> {
     const { data } = await api.put<UserProfile>('/users/me', payload)
+    return data
+  },
+
+  /**
+   * POST /api/users/me/gemini-key
+   * Required before the first upload: ingestion fails with
+   * "Gemini API key missing" until the user has stored a key.
+   */
+  async saveGeminiKey(apiKey: string): Promise<GeminiKeyResponse> {
+    const { data } = await api.post<GeminiKeyResponse>('/users/me/gemini-key', {
+      apiKey,
+    })
     return data
   },
 }

@@ -1,10 +1,25 @@
 import { api, ingestClient } from './client'
-import type { KnowledgeDocument, UploadForm, UploadResponse } from './types'
+import type {
+  KnowledgeDocument,
+  KnowledgeListParams,
+  KnowledgeNotesResponse,
+  UploadForm,
+  UploadResponse,
+} from './types'
 
 export const knowledgeApi = {
-  /** GET /api/knowledge — documents belonging to the authenticated user. */
-  async list(): Promise<KnowledgeDocument[]> {
-    const { data } = await api.get<KnowledgeDocument[]>('/knowledge')
+  /**
+   * GET /api/knowledge?timeline=today|30days|all&subject=…
+   * No pagination — the endpoint returns the full array.
+   */
+  async list(params: KnowledgeListParams = {}): Promise<KnowledgeDocument[]> {
+    const { data } = await api.get<KnowledgeDocument[]>('/knowledge', {
+      params: {
+        ...(params.timeline ? { timeline: params.timeline } : {}),
+        ...(params.subject ? { subject: params.subject } : {}),
+        ...(params.tag ? { tag: params.tag } : {}),
+      },
+    })
     return Array.isArray(data) ? data : []
   },
 
@@ -19,6 +34,25 @@ export const knowledgeApi = {
     await api.delete(`/knowledge/${id}`)
   },
 
+  /** GET /api/knowledge/notes — detailed and short notes for the signed-in user. */
+  async notes(
+    params: Pick<KnowledgeListParams, 'timeline' | 'subject'> = {},
+  ): Promise<KnowledgeNotesResponse> {
+    const { data } = await api.get<KnowledgeNotesResponse>('/knowledge/notes', {
+      params: {
+        ...(params.timeline ? { timeline: params.timeline } : {}),
+        ...(params.subject ? { subject: params.subject } : {}),
+      },
+    })
+    return {
+      userId: data?.userId ?? '',
+      timeline: data?.timeline ?? params.timeline ?? '30days',
+      subject: data?.subject ?? null,
+      detailedNotes: Array.isArray(data?.detailedNotes) ? data.detailedNotes : [],
+      shortNotes: Array.isArray(data?.shortNotes) ? data.shortNotes : [],
+    }
+  },
+
   /**
    * POST /api/v1/ingestion/upload
    *
@@ -27,17 +61,21 @@ export const knowledgeApi = {
    * synchronously before responding, so this can take minutes. We send
    * onUploadProgress for the transfer portion and then show an indeterminate
    * "processing" state until the response lands.
+   *
+   * Requires the user to have saved a Gemini key first via
+   * POST /api/users/me/gemini-key.
    */
   async upload(
     form: UploadForm,
     onProgress?: (percent: number) => void,
   ): Promise<UploadResponse> {
     const body = new FormData()
-    body.append('file', form.file)
-    body.append('sourceType', form.sourceType)
-    if (form.title) body.append('title', form.title)
-    if (form.description) body.append('description', form.description)
-    if (form.learningDate) body.append('learningDate', form.learningDate)
+    body.append('File', form.file)
+    body.append('SourceType', form.sourceType)
+    if (form.title) body.append('Title', form.title)
+    if (form.description) body.append('Description', form.description)
+    if (form.subject) body.append('Subject', form.subject)
+    if (form.learningDate) body.append('LearningDate', form.learningDate)
 
     const { data } = await ingestClient.post<UploadResponse>(
       '/v1/ingestion/upload',

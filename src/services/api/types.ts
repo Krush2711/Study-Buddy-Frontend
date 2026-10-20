@@ -2,17 +2,14 @@
  * Types mirroring the actual server contracts.
  *
  * Sources (read from the repo, not invented):
- * - StudyBuddy.BLL/DTOs/**/
-//  *.cs — auth, user, document, admin shapes
-  // - StudyBuddy.Knowledge/Models/*.cs — Mongo knowledge + notes documents
-  // - Ai/App/schemas/*.py — FastAPI request/response models
-//  *
-//  * JSON casing: ASP.NET Core's default System.Text.Json policy is camelCase,
-//  * and every FastAPI model already uses camelCase field names, so properties
-//  * below stay camelCase to match the wire format exactly.
-//  */
-
-// Your TypeScript interfaces and types start here
+ *  - StudyBuddy.BLL/DTOs/**\/*.cs — auth, user, document, admin shapes
+ *  - StudyBuddy.Knowledge/Models/*.cs — Mongo knowledge + notes documents
+ *  - Ai/App/schemas/*.py — FastAPI request/response models
+ *
+ * JSON casing: ASP.NET Core's default System.Text.Json policy is camelCase,
+ * and every FastAPI model already uses camelCase field names, so properties
+ * below stay camelCase to match the wire format exactly.
+ */
 /* ------------------------------- Auth ---------------------------------- */
 
 export interface RegisterRequest {
@@ -39,6 +36,10 @@ export interface LoginResponse {
   fullName: string
   email: string
   token: string
+  /** Long-lived token exchanged at POST /api/refresh. */
+  refreshToken?: string
+  /** Access-token lifetime in seconds. */
+  expiresIn?: number
 }
 
 /* ------------------------------- User ---------------------------------- */
@@ -60,6 +61,11 @@ export interface UpdateProfileRequest {
   profileImageUrl: string
 }
 
+/** POST /api/users/me/gemini-key -> { message } */
+export interface GeminiKeyResponse {
+  message: string
+}
+
 /* ----------------------------- Knowledge ------------------------------- */
 
 /**
@@ -75,6 +81,8 @@ export interface KnowledgeDocument {
   extractedText: string
   metadata: Record<string, string>
   createdAt: string
+  /** Calendar day the user picked at upload; null for older documents. */
+  learningDate?: string | null
   summary: string
   subject: string
   category: string
@@ -114,7 +122,31 @@ export interface UploadForm {
   sourceType: string
   title?: string
   description?: string
+  subject?: string
   learningDate?: string
+}
+
+/* ----------------------------- Knowledge filters ----------------------- */
+
+export type KnowledgeTimeline = 'today' | '30days' | 'all'
+
+export interface KnowledgeListParams {
+  timeline?: KnowledgeTimeline
+  /** Filter by subject. `tag` is an alias accepted by the API. */
+  subject?: string
+  tag?: string
+}
+
+/**
+ * GET /api/knowledge/notes — the authenticated user's persisted notes.
+ * Defaults to timeline=30days on the server.
+ */
+export interface KnowledgeNotesResponse {
+  userId: string
+  timeline: string
+  subject: string | null
+  detailedNotes: DetailedNotesDocument[]
+  shortNotes: ShortNotesDocument[]
 }
 
 /* ------------------------------- Admin --------------------------------- */

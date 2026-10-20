@@ -3,13 +3,37 @@ import axios, {
   type AxiosInstance,
   type InternalAxiosRequestConfig,
 } from 'axios'
+import type { LoginResponse } from './types'
 import type { ApiErrorShape, SessionUser } from './types'
 
 /* --------------------------- Configuration ----------------------------- */
 
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? '/api'
+/**
+ * Hosted StudyBuddy API. In development the Vite proxy forwards `/api` here so
+ * the browser never makes a cross-origin request; a production build talks to
+ * the hosted origin directly (the API must allow the app's origin via CORS).
+ */
+export const REMOTE_API_ORIGIN = (
+  // import.meta.env.VITE_API_ORIGIN ?? 'https://krushnas2.studybuddy.blitz.cloud'
+  import.meta.env.VITE_API_ORIGIN ?? 'https://localhost:7217'
+).replace(/\/+$/, '')
+
+const API_BASE_URL =
+  import.meta.env.VITE_API_BASE_URL ??
+  (import.meta.env.DEV ? '/api' : `${REMOTE_API_ORIGIN}/api`)
 const AI_BASE_URL = import.meta.env.VITE_AI_BASE_URL ?? '/ai'
-const GOOGLE_AUTH_URL = import.meta.env.VITE_GOOGLE_AUTH_URL ?? '/api/login-google'
+const GOOGLE_AUTH_URL =
+  import.meta.env.VITE_GOOGLE_AUTH_URL ?? `${REMOTE_API_ORIGIN}/api/login-google`
+/**
+ * In development this exchange goes through the Vite proxy so the request is
+ * same-origin: the local Kestrel instance registers no CORS policy for the
+ * dev server's origin, and a direct cross-origin fetch with credentials would
+ * be blocked by the browser. Cookies are host-scoped (`localhost`, any port),
+ * so the auth cookie set during the popup hop is still presented to the proxy.
+ */
+const GOOGLE_EXCHANGE_URL = import.meta.env.DEV
+  ? '/api/auth/google-response'
+  : `${REMOTE_API_ORIGIN}/api/auth/google-response`
 
 const REQUEST_TIMEOUT_MS = 30_000
 /** Document ingestion runs OCR + Gemini synchronously; the server allows 10 min. */
@@ -20,12 +44,14 @@ const AI_TIMEOUT_MS = 5 * 60 * 1000
 export const storageKeys = {
   token: 'studybuddy.token',
   user: 'studybuddy.user',
+  refreshToken: 'studybuddy.refreshToken',
 } as const
 
 export const config = {
   apiBaseUrl: API_BASE_URL,
   aiBaseUrl: AI_BASE_URL,
   googleAuthUrl: GOOGLE_AUTH_URL,
+  remoteOrigin: REMOTE_API_ORIGIN,
 }
 
 /* ------------------------------ Errors --------------------------------- */
@@ -81,20 +107,20 @@ export function toApiError(error: unknown): ApiErrorShape {
     // Shape 2: model validation
     const rawErrors = (data as { errors?: unknown } | undefined)?.errors
 
-if (
-  rawErrors &&
-  typeof rawErrors === 'object' &&
-  !Array.isArray(rawErrors)
-) {
-  const errors = rawErrors as Record<string, string[]>
-  const flat = Object.values(errors).flat().filter(Boolean)
+    if (
+      rawErrors &&
+      typeof rawErrors === 'object' &&
+      !Array.isArray(rawErrors)
+    ) {
+      const errors = rawErrors as Record<string, string[]>
+      const flat = Object.values(errors).flat().filter(Boolean)
 
-  return {
-    status,
-    message: flat[0] ?? 'Some fields need attention.',
-    fieldErrors: errors,
-  }
-}
+      return {
+        status,
+        message: flat[0] ?? 'Some fields need attention.',
+        fieldErrors: errors,
+      }
+    }
 
     // Shape 1: exception-envelope (server spells it `message`)
     const envelopeMessage =
@@ -107,13 +133,7 @@ if (
     }
 
     // Plain string body
-if (
-  typeof data === 'string' &&
-  data.trim().length > 0 &&
-  data.length < 300
-) {
-  return { status, message: data }
-}    if (typeof data === 'string' && data.trim() && data.length < 300) {
+    if (typeof data === 'string' && data.trim() && data.length < 300) {
       return { status, message: data }
     }
 
@@ -160,6 +180,13 @@ export const sessionStore = {
       return null
     }
   },
+  getRefreshToken(): string | null {
+    try {
+      return localStorage.getItem(storageKeys.refreshToken)
+    } catch {
+      return null
+    }
+  },
   getUser(): SessionUser | null {
     try {
       const raw = localStorage.getItem(storageKeys.user)
@@ -171,10 +198,13 @@ export const sessionStore = {
       return null
     }
   },
-  save(token: string, user: SessionUser): void {
+  save(token: string, user: SessionUser, refreshToken?: string): void {
     try {
       localStorage.setItem(storageKeys.token, token)
       localStorage.setItem(storageKeys.user, JSON.stringify(user))
+      if (refreshToken) {
+        localStorage.setItem(storageKeys.refreshToken, refreshToken)
+      }
     } catch {
       /* storage disabled — the session still works for this tab */
     }
@@ -183,6 +213,7 @@ export const sessionStore = {
     try {
       localStorage.removeItem(storageKeys.token)
       localStorage.removeItem(storageKeys.user)
+      localStorage.removeItem(storageKeys.refreshToken)
     } catch {
       /* no-op */
     }
@@ -218,14 +249,150 @@ export function hasAdminApiKey(): boolean {
 
 /* ------------------------------ Clients -------------------------------- */
 
-function attachAuthHeader(
-  request: InternalAxiosRequestConfig,
-): InternalAxiosRequestConfig {
-  const token = sessionStore.getToken()
-  if (token) {
-    request.headers.set('Authorization', `Bearer ${token}`)
+/* --------------------------- Token renewal ----------------------------- */
+
+/**
+ * Access tokens are short-lived (15 minutes), so the client renews them
+ * instead of waiting for a 401 that would surface as a spurious logout.
+ *
+ * Two triggers, both feeding the same single-flight promise:
+ *  - proactive: a request is about to go out with a token close to expiry
+ *  - reactive: the server already answered 401
+ *
+ * One refresh at a time is essential — a page that fires six requests must
+ * not start six rotations, because rotation invalidates the previous token
+ * and the extra rotations would then look like token replay.
+ */
+const REFRESH_ENDPOINT = `${API_BASE_URL}/refresh`
+
+/** Renew this long before the token actually expires. */
+const REFRESH_SKEW_MS = 60_000
+
+let refreshInFlight: Promise<boolean> | null = null
+let refreshTimer: number | null = null
+
+interface JwtPayload {
+  exp?: number
+}
+
+/** Reads `exp` without verifying the signature — the server is the authority. */
+function readTokenExpiryMs(token: string): number | null {
+  try {
+    const payload = token.split('.')[1]
+    if (!payload) return null
+
+    const normalized = payload.replace(/-/g, '+').replace(/_/g, '/')
+    const padded = normalized.padEnd(
+      normalized.length + ((4 - (normalized.length % 4)) % 4),
+      '=',
+    )
+
+    const decoded = JSON.parse(atob(padded)) as JwtPayload
+
+    return typeof decoded.exp === 'number' ? decoded.exp * 1000 : null
+  } catch {
+    return null
   }
-  return request
+}
+
+function isExpiringSoon(token: string): boolean {
+  const expiresAt = readTokenExpiryMs(token)
+
+  // An unreadable token is treated as fine: the 401 path still covers it.
+  if (expiresAt === null) return false
+
+  return expiresAt - Date.now() <= REFRESH_SKEW_MS
+}
+
+/** Schedules a refresh for a moment before the token dies. */
+function scheduleRefresh(token: string): void {
+  if (refreshTimer !== null) {
+    window.clearTimeout(refreshTimer)
+    refreshTimer = null
+  }
+
+  const expiresAt = readTokenExpiryMs(token)
+  if (expiresAt === null) return
+
+  const delay = Math.max(1_000, expiresAt - Date.now() - REFRESH_SKEW_MS)
+  refreshTimer = window.setTimeout(() => void refreshSession(), delay)
+}
+
+/**
+ * Exchanges the stored refresh token for a new pair. Resolves true on success.
+ * Concurrent callers share one in-flight request.
+ */
+export function refreshSession(): Promise<boolean> {
+  if (refreshInFlight) return refreshInFlight
+
+  const refreshToken = sessionStore.getRefreshToken()
+
+  if (!refreshToken) {
+    return Promise.resolve(false)
+  }
+
+  refreshInFlight = (async () => {
+    try {
+      // Deliberately a bare axios call: going through `api` would re-enter
+      // this interceptor and a failed refresh would recurse.
+      const { data } = await axios.post<LoginResponse>(
+        REFRESH_ENDPOINT,
+        { refreshToken },
+        { timeout: REQUEST_TIMEOUT_MS, headers: { Accept: 'application/json' } },
+      )
+
+      if (!data?.token) return false
+
+      const current = sessionStore.getUser()
+      const user: SessionUser = current ?? {
+        id: data.id,
+        fullName: data.fullName,
+        email: data.email,
+      }
+
+      sessionStore.save(data.token, user, data.refreshToken)
+      scheduleRefresh(data.token)
+
+      return true
+    } catch {
+      return false
+    } finally {
+      refreshInFlight = null
+    }
+  })()
+
+  return refreshInFlight
+}
+
+/**
+ * Called once a session is established (login, Google, restored session) so
+ * renewal runs on a timer rather than only when something happens to fail.
+ */
+export function startSessionKeepAlive(): void {
+  const token = sessionStore.getToken()
+  if (token) scheduleRefresh(token)
+}
+
+export function stopSessionKeepAlive(): void {
+  if (refreshTimer !== null) {
+    window.clearTimeout(refreshTimer)
+    refreshTimer = null
+  }
+}
+
+/* -------------------- Authorization on a live token -------------------- */
+
+/**
+ * Installed by AuthContext. The interceptor below cannot navigate, and it must
+ * not silently drop a session that a refresh could have saved.
+ */
+type SessionRefreshedHandler = () => void
+let onSessionRefreshed: SessionRefreshedHandler | null = null
+
+export function setSessionRefreshedHandler(
+  handler: SessionRefreshedHandler | null,
+): void {
+  onSessionRefreshed = handler
 }
 
 function createClient(baseURL: string, timeout: number): AxiosInstance {
@@ -236,24 +403,75 @@ function createClient(baseURL: string, timeout: number): AxiosInstance {
     headers: { Accept: 'application/json' },
   })
 
-  instance.interceptors.request.use(attachAuthHeader)
+  instance.interceptors.request.use(async (request) => {
+    const token = sessionStore.getToken()
+
+    // Renew before the call rather than letting it fail: a request that is
+    // about to be rejected is cheaper to fix than to retry.
+    if (token && isExpiringSoon(token)) {
+      const refreshed = await refreshSession()
+      if (refreshed) {
+        onSessionRefreshed?.()
+        const next = sessionStore.getToken()
+        if (next) request.headers.set('Authorization', `Bearer ${next}`)
+        return request
+      }
+    }
+
+    if (token) {
+      request.headers.set('Authorization', `Bearer ${token}`)
+    }
+    return request
+  })
 
   instance.interceptors.response.use(
     (response) => response,
-    (error: unknown) => {
-      if (axios.isAxiosError(error) && error.response?.status === 401) {
-        // Only a token-bearing request means the session is dead. A failed
-        // login also returns 401 and must NOT clear an existing session.
-        const hadToken = Boolean(sessionStore.getToken())
-        const isAuthAttempt = /\/login$|\/auth$/.test(
-          error.config?.url ?? '',
-        )
-        if (hadToken && !isAuthAttempt) {
-          sessionStore.clear()
-          onUnauthorized?.()
-        }
+    async (error: unknown) => {
+      if (!axios.isAxiosError(error) || error.response?.status !== 401) {
+        return Promise.reject(error)
       }
-      return Promise.reject(error)
+
+      const axiosError = error as AxiosError<unknown>
+      const original = axiosError.config as
+        | (InternalAxiosRequestConfig & { _retriedAfterRefresh?: boolean })
+        | undefined
+
+      const isAuthAttempt = /\/login$|\/auth$|\/refresh$|\/logout$/.test(
+        original?.url ?? '',
+      )
+      const hadToken = Boolean(sessionStore.getToken())
+
+      // A failed login also returns 401 and must NOT clear a live session.
+      if (!hadToken || isAuthAttempt) {
+        return Promise.reject(error)
+      }
+
+      // Already renewed once for this request — the session is genuinely gone.
+      if (original?._retriedAfterRefresh) {
+        sessionStore.clear()
+        stopSessionKeepAlive()
+        onUnauthorized?.()
+        return Promise.reject(error)
+      }
+
+      const refreshed = await refreshSession()
+
+      if (!refreshed || !original) {
+        sessionStore.clear()
+        stopSessionKeepAlive()
+        onUnauthorized?.()
+        return Promise.reject(error)
+      }
+
+      onSessionRefreshed?.()
+
+      const next = sessionStore.getToken()
+      if (next) {
+        original.headers.set('Authorization', `Bearer ${next}`)
+      }
+      original._retriedAfterRefresh = true
+
+      return instance.request(original)
     },
   )
 
@@ -287,19 +505,80 @@ export const adminApi: AxiosInstance = axios.create({
 })
 
 adminApi.interceptors.request.use((request) => {
+  // The admin API accepts either an admin JWT or the API key. Send whichever
+  // credential this tab holds; the server decides whether it is privileged.
+  const token = sessionStore.getToken()
+  if (token) {
+    request.headers.set('Authorization', `Bearer ${token}`)
+  }
   if (adminApiKey) {
     request.headers.set('X-Admin-Api-Key', adminApiKey)
   }
   return request
 })
 
-/** Verifies a candidate admin key by hitting a protected endpoint. */
-export async function verifyAdminKey(candidate: string): Promise<void> {
+/**
+ * Verifies an admin credential by hitting a protected admin endpoint.
+ * Pass a key to test X-Admin-Api-Key, or null to test the current JWT.
+ */
+export async function verifyAdminKey(candidate: string | null): Promise<void> {
+  const headers: Record<string, string> = { Accept: 'application/json' }
+  if (candidate) {
+    headers['X-Admin-Api-Key'] = candidate
+  } else {
+    const token = sessionStore.getToken()
+    if (!token) throw new Error('Sign in as an administrator first.')
+    headers.Authorization = `Bearer ${token}`
+  }
+
   await axios.get(`${API_BASE_URL}/admin/users`, {
     timeout: REQUEST_TIMEOUT_MS,
-    headers: {
-      Accept: 'application/json',
-      'X-Admin-Api-Key': candidate,
-    },
+    headers,
   })
+}
+
+/* --------------------------- Google exchange --------------------------- */
+
+/**
+ * Completes the Google round trip.
+ *
+ * GET /api/login-google is opened as a top-level navigation (or a popup). After
+ * Google redirects to /api/auth/google-response, the API returns the login
+ * payload as JSON instead of redirecting back into the SPA. The auth cookie set
+ * during that hop is what authorises this call, so it MUST be sent with
+ * credentials: 'include' — and the hosted API must allow this origin with
+ * Access-Control-Allow-Credentials.
+ */
+export async function exchangeGoogleSession(): Promise<LoginResponse> {
+  let response: Response
+  try {
+    response = await fetch(GOOGLE_EXCHANGE_URL, {
+      method: 'GET',
+      credentials: 'include',
+      headers: { Accept: 'application/json' },
+    })
+  } catch {
+    throw new Error(
+      'Could not reach the Google sign-in exchange. The hosted API may not allow this origin (CORS with credentials).',
+    )
+  }
+
+  if (!response.ok) {
+    let message = defaultMessageForStatus(response.status)
+    try {
+      const body = (await response.json()) as { message?: string }
+      if (body?.message) message = body.message
+    } catch {
+      /* non-JSON error body */
+    }
+    const error = new Error(message) as Error & { status?: number }
+    error.status = response.status
+    throw error
+  }
+
+  const payload = (await response.json()) as LoginResponse
+  if (!payload?.token) {
+    throw new Error('Google sign-in did not return a session token.')
+  }
+  return payload
 }

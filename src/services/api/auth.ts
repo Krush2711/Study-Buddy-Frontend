@@ -1,4 +1,4 @@
-import { api } from './client'
+import { api, exchangeGoogleSession } from './client'
 import type { LoginRequest, LoginResponse, RegisterRequest, RegisterResponse } from './types'
 
 /**
@@ -21,11 +21,34 @@ export const authApi = {
   },
 
   /**
+   * POST /api/refresh — exchanges the long-lived refresh token for a new pair.
+   * Rotation means the old refresh token is dead once this returns, so callers
+   * must persist the new one.
+   */
+  async refresh(refreshToken: string): Promise<LoginResponse> {
+    const { data } = await api.post<LoginResponse>('/refresh', { refreshToken })
+    return data
+  },
+
+  /** POST /api/logout — revokes the refresh token server-side. */
+  async logout(refreshToken: string): Promise<void> {
+    await api.post('/logout', { refreshToken })
+  },
+
+  /**
    * GET /api/profile — backend smoke test for the bearer token.
    * Returns the literal string "Authenticated".
    */
   async ping(): Promise<string> {
     const { data } = await api.get<string>('/profile')
     return data
+  },
+
+  /**
+   * Completes the Google OAuth round trip by exchanging the auth cookie set on
+   * /api/auth/google-response for a login payload. Sent with credentials: include.
+   */
+  async exchangeGoogle(): Promise<LoginResponse> {
+    return exchangeGoogleSession()
   },
 }
