@@ -18,7 +18,7 @@ const API_PROXY = {
     // poll (/api/auth/google-response). If the two differ, the auth cookie set
     // during the popup hop is presented to a different API and sign-in hangs.
     // target: 'https://krushnas2.studybuddy.blitz.cloud',
-    target: 'https://localhost:7217',
+    target: 'https://krushnas.studybuddy.blitz.cloud/',
     changeOrigin: true,
     // The ASP.NET Core dev certificate is self-signed; Node rejects it with
     // DEPTH_ZERO_SELF_SIGNED_CERT when secure is true, which makes every /api

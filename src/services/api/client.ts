@@ -15,7 +15,7 @@ import type { ApiErrorShape, SessionUser } from './types'
  */
 export const REMOTE_API_ORIGIN = (
   // import.meta.env.VITE_API_ORIGIN ?? 'https://krushnas2.studybuddy.blitz.cloud'
-  import.meta.env.VITE_API_ORIGIN ?? 'https://localhost:7217'
+  import.meta.env.VITE_API_ORIGIN ?? 'https://krushnas.studybuddy.blitz.cloud/'
 ).replace(/\/+$/, '')
 
 const API_BASE_URL =
